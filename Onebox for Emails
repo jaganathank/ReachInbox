@@ -1,0 +1,145 @@
+import imaplib
+import email
+from email.header import decode_header
+import os
+from fastapi import FastAPI, BackgroundTasks
+from elasticsearch import Elasticsearch
+from openai import OpenAI
+import requests
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# IMAP Config
+IMAP_SERVER = "imap.gmail.com"
+USERNAME = os.getenv("EMAIL_USERNAME")
+PASSWORD = os.getenv("EMAIL_PASSWORD")
+
+# OpenAI API Key
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Slack Webhook URL
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+
+# Initialize FastAPI
+app = FastAPI()
+
+# Connect to Elasticsearch
+es = Elasticsearch("http://localhost:9200")
+
+# OpenAI Client
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+@app.get("/")
+async def root():
+    return {"message": "Onebox Email Aggregator Running!"}
+
+
+def fetch_emails():
+    """ Fetch last 30 days of emails from IMAP and store them in Elasticsearch """
+    mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+    mail.login(USERNAME, PASSWORD)
+    mail.select("inbox")
+
+    # Fetch last 30 days of emails
+    result, data = mail.search(None, "SINCE 30-Aug-2023")
+    email_ids = data[0].split()
+
+    for email_id in email_ids:
+        result, msg_data = mail.fetch(email_id, "(RFC822)")
+        raw_email = msg_data[0][1]
+        msg = email.message_from_bytes(raw_email)
+
+        subject, encoding = decode_header(msg["Subject"])[0]
+        if isinstance(subject, bytes):
+            subject = subject.decode(encoding or "utf-8")
+
+        sender = msg.get("From")
+        body = ""
+
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    body = part.get_payload(decode=True).decode()
+                    break
+        else:
+            body = msg.get_payload(decode=True).decode()
+
+        email_data = {
+            "id": email_id.decode(),
+            "subject": subject,
+            "sender": sender,
+            "body": body
+        }
+        store_email(email_data)
+    
+    mail.logout()
+
+
+@app.get("/sync-emails/")
+async def sync_emails(background_tasks: BackgroundTasks):
+    """ Trigger background email fetching process """
+    background_tasks.add_task(fetch_emails)
+    return {"status": "Email sync started in background"}
+
+
+def store_email(email_data):
+    """ Store fetched email in Elasticsearch """
+    es.index(index="emails", id=email_data["id"], document=email_data)
+
+
+@app.get("/search/")
+async def search(query: str):
+    """ Search emails in Elasticsearch """
+    response = es.search(index="emails", body={
+        "query": {
+            "match": {
+                "body": query
+            }
+        }
+    })
+    return response["hits"]["hits"]
+
+
+def categorize_email(email_body):
+    """ Categorize emails using OpenAI GPT-4 """
+    prompt = f"Classify the email into one of these categories: Interested, Meeting Booked, Not Interested, Spam, Out of Office.\n\nEmail:\n{email_body}\n\nCategory:"
+    response = client.completions.create(
+        model="gpt-4",
+        messages=[{"role": "system", "content": prompt}]
+    )
+    return response.choices[0].text.strip()
+
+
+@app.post("/categorize/")
+async def categorize(email_id: str, email_body: str):
+    """ Categorize email and trigger Slack notification if 'Interested' """
+    category = categorize_email(email_body)
+    if category == "Interested":
+        send_slack_notification(email_body)
+    return {"email_id": email_id, "category": category}
+
+
+def send_slack_notification(email_body):
+    """ Send Slack notification when an email is categorized as 'Interested' """
+    payload = {"text": f"New Interested Email: {email_body}"}
+    requests.post(SLACK_WEBHOOK_URL, json=payload)
+
+
+def generate_reply(email_body):
+    """ AI-Powered Suggested Replies using GPT-4 """
+    prompt = f"Generate a professional reply to the following email:\n\n{email_body}"
+    response = client.completions.create(
+        model="gpt-4",
+        messages=[{"role": "system", "content": prompt}]
+    )
+    return response.choices[0].text.strip()
+
+
+@app.post("/suggest-reply/")
+async def suggest_reply(email_body: str):
+    """ Generate AI-Powered Suggested Reply """
+    reply = generate_reply(email_body)
+    return {"email_body": email_body, "suggested_reply": reply}
